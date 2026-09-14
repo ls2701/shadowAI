@@ -64,7 +64,6 @@ INTERNAL_SUBNET = [f"192.168.0.{n}" for n in (7, 8, 9, 11, 18, 19, 22, 33)]
 AI_REAL_DOMAINS = [
     "chatgpt.com",
     "api.openai.com",
-    "claude.ai",
     "api.anthropic.com",
     "gemini.google.com",
     "perplexity.ai",

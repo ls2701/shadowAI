@@ -5,6 +5,7 @@ import csv
 import itertools
 import json
 import math
+import os
 import re
 import sys
 import threading
@@ -16,6 +17,7 @@ from threading import local
 from collections import defaultdict, Counter
 from urllib.parse import urlparse
 import queue
+import requests
 
 import chromadb
 from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
@@ -56,6 +58,21 @@ WEAK_AI_THRESHOLD = 0.50
 MIN_DYNAMIC_DOMAIN_OBSERVATIONS = 1
 CACHE_SAVE_INTERVAL = 100
 UNKNOWN_RECHECK_SECONDS = 7 * 24 * 3600
+
+# ------------------------------------------------------------
+# Domain classifier backend — the ONLY place DeepSeek is used.
+# analyze_chunk() still goes to Ollama.
+# ------------------------------------------------------------
+CLASSIFIER_BACKEND = "deepseek"                  # "deepseek" | "ollama"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_CLASSIFY_MODEL = "deepseek-chat"
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_TIMEOUT = 60
+DEEPSEEK_MAX_RETRIES = 3
+
+# DeepSeek is cloud-hosted, so we can push batches/parallelism way up
+DEEPSEEK_DOMAIN_BATCH_SIZE = 20
+DEEPSEEK_CLASSIFIER_WORKERS = 8
 
 # ============================================================
 # DEBUG / VERBOSITY
@@ -158,17 +175,7 @@ def _fire_early_submission(domain: str) -> None:
 # STATIC AI DOMAIN LIST
 # ============================================================
 AI_APPLICATIONS: dict[str, tuple[str, bool]] = {
-    "chatgpt.com": ("ChatGPT", False),
-    "openai.com": ("ChatGPT", False),
-    "claude.ai": ("Claude", False),
-    "anthropic.com": ("Claude", False),
-    "gemini.google.com": ("Gemini", False),
-    "perplexity.ai": ("Perplexity", False),
-    "cursor.com": ("Cursor", False),
-    "huggingface.co": ("Hugging Face", False),
-    "monica.im": ("Monica", False),
-    "sider.ai": ("Sider", False),
-    "getmerlin.in": ("Merlin", False),
+    "chatgpt.com": ("ChatGPT", False)
 }
 
 AWS_AI_EVENT_SOURCES = (
@@ -491,6 +498,66 @@ Domains:
 """
 
 
+def _deepseek_chat_json(prompt: str,
+                        model: str = DEEPSEEK_CLASSIFY_MODEL,
+                        api_key: str = "",
+                        timeout: float = DEEPSEEK_TIMEOUT,
+                        max_retries: int = DEEPSEEK_MAX_RETRIES) -> dict:
+    """
+    Call DeepSeek chat completion in JSON mode. Returns parsed JSON object.
+    Retries on 429 / 5xx with exponential backoff.
+    """
+    key = api_key or DEEPSEEK_API_KEY
+    if not key:
+        raise RuntimeError(
+            "DeepSeek API key missing. Set DEEPSEEK_API_KEY env var "
+            "or pass --deepseek-api-key."
+        )
+
+    url = f"{DEEPSEEK_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": model,
+        "messages": [
+            # DeepSeek JSON mode requires the word "json" in the prompt.
+            {"role": "system", "content": "Reply with JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0,
+        "max_tokens": 2048,
+        "stream": False,
+    }
+
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.post(url, headers=headers, json=body, timeout=timeout)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+                time.sleep(2 ** attempt)
+                continue
+            r.raise_for_status()
+            payload = r.json()
+            content = payload["choices"][0]["message"]["content"].strip()
+            if content.startswith("```"):
+                content = content.split("```")[1]
+                if content.startswith("json"):
+                    content = content[4:]
+            return json.loads(content)
+        except (requests.RequestException, json.JSONDecodeError,
+                KeyError, IndexError) as e:
+            last_err = str(e)
+            time.sleep(2 ** attempt)
+
+    raise RuntimeError(
+        f"DeepSeek call failed after {max_retries} attempts: {last_err}"
+    )
+
+
 class DomainClassifier:
     def __init__(
         self,
@@ -498,10 +565,19 @@ class DomainClassifier:
         batch_size: int = DOMAIN_BATCH_SIZE,
         classifier_workers: int = DOMAIN_CLASSIFIER_WORKERS,
         recheck_seconds: float = UNKNOWN_RECHECK_SECONDS,
+        # --- NEW: DeepSeek support ---
+        backend: str = CLASSIFIER_BACKEND,
+        deepseek_api_key: str = "",
+        deepseek_model: str = DEEPSEEK_CLASSIFY_MODEL,
     ):
         self.model = model
         self.batch_size = batch_size
         self.recheck_seconds = recheck_seconds
+        # --- NEW ---
+        self.backend = backend
+        self.deepseek_api_key = deepseek_api_key or DEEPSEEK_API_KEY
+        self.deepseek_model = deepseek_model
+
         self.pending_queue: queue.Queue[str] = queue.Queue()
         self.stop_event = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=classifier_workers)
@@ -516,8 +592,9 @@ class DomainClassifier:
         self.worker_thread = threading.Thread(target=self._collector, daemon=True)
         self.worker_thread.start()
         dprint(
-            f"DomainClassifier started: model={model}, batch_size={batch_size}, "
-            f"workers={classifier_workers}, recheck_seconds={recheck_seconds:.0f}"
+            f"DomainClassifier started: backend={backend}, "
+            f"model={self.deepseek_model if backend == 'deepseek' else model}, "
+            f"batch_size={batch_size}, workers={classifier_workers}"
         )
 
     def submit(self, domain: str) -> None:
@@ -663,26 +740,38 @@ class DomainClassifier:
                 else:
                     self.ai_conf_buckets["<0.50"] += 1
 
+    def _call_model_json(self, prompt: str) -> dict:
+        """Dispatch to the configured backend. Returns parsed JSON object."""
+        if self.backend == "deepseek":
+            return _deepseek_chat_json(
+                prompt,
+                model=self.deepseek_model,
+                api_key=self.deepseek_api_key,
+            )
+
+        # --- ollama path (unchanged) ---
+        client = get_ollama_client()
+        resp = client.chat(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            format="json",
+            options={"temperature": 0, "num_predict": 2048},
+            keep_alive="24h",
+        )
+        raw = resp["message"]["content"].strip()
+        if "<think>" in raw:
+            raw = raw.split("</think>")[-1].strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        return json.loads(raw)
+
     def _classify_batch(self, domains: list[str]) -> None:
         if self._disabled.is_set():
             return
 
-        dprint(f"_classify_batch: sending {len(domains)} domains to {self.model}")
-        dprint(f"  domains: {domains}")
+        dprint(f"_classify_batch: sending {len(domains)} domains via {self.backend}")
         try:
-            client = get_ollama_client()
             prompt = BATCH_CLASSIFY_PROMPT.replace("<<DOMAINS>>", "\n".join(domains))
-            resp = client.chat(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                format="json",
-                options={"temperature": 0},
-            )
-            raw = resp["message"]["content"].strip()
-            if "<think>" in raw:
-                raw = raw.split("</think>")[-1].strip()
-            raw = raw.replace("```json", "").replace("```", "").strip()
-            result = json.loads(raw)
+            result = self._call_model_json(prompt)
             if not isinstance(result, dict):
                 result = {}
 
@@ -701,7 +790,6 @@ class DomainClassifier:
                 reason = str(res.get("reason", "") or "")
 
                 status, tier_label = self._tier_from_verdict(classification, confidence)
-
                 if status in ("non_ai", "unknown"):
                     app_name = None
 
@@ -729,13 +817,18 @@ class DomainClassifier:
                         except Exception as cb_exc:
                             dprint(f"early-submission callback failed for {d}: {cb_exc}")
 
+        except RuntimeError as e:
+            # Bad API key, no balance, exhausted retries
+            msg = str(e)
+            print(f"  [classify error] {msg}")
+            if "401" in msg or "403" in msg or "API key" in msg or "402" in msg:
+                print("  [classify] DISABLING classifier — check your DeepSeek key / balance.")
+                self._disabled.set()
+            return
         except ResponseError as e:
+            # only reachable on the ollama path
             print(f"  [classify error] {type(e).__name__}: {e}")
-            print(
-                f"  [classify] DISABLING classifier for this run "
-                f"(model={self.model!r} may be missing or the server is unhealthy). "
-                f"{len(domains)} domain(s) left unresolved."
-            )
+            print(f"  [classify] DISABLING classifier for this run.")
             self._disabled.set()
             return
         except (ConnectionError, TimeoutError, OSError) as e:
@@ -746,7 +839,8 @@ class DomainClassifier:
             print(f"  [classify error] {type(e).__name__}: {e}")
             traceback.print_exc()
             for d in domains:
-                cache_set(d, "unknown", None, False, 0.0, reason=f"classify exception: {e}")
+                cache_set(d, "unknown", None, False, 0.0,
+                          reason=f"classify exception: {e}")
 
     def print_run_tally(self) -> None:
         with self._tally_lock:
@@ -2624,7 +2718,13 @@ def _extract_ollama_model_names(models_raw) -> list[str]:
 
 
 def _verify_required_models() -> None:
-    required = [EMBEDDING_MODEL, ANALYSIS_MODEL, DOMAIN_CLASSIFY_MODEL]
+    # When the classifier runs on DeepSeek, the local classifier model is not
+    # required. Only the embedding + analyzer models need to exist locally.
+    if CLASSIFIER_BACKEND == "deepseek":
+        required = [EMBEDDING_MODEL, ANALYSIS_MODEL]
+    else:
+        required = [EMBEDDING_MODEL, ANALYSIS_MODEL, DOMAIN_CLASSIFY_MODEL]
+
     try:
         client = Client(
             host=f"http://{DEFAULT_OLLAMA_HOST}:{OLLAMA_PORT}",
@@ -2645,6 +2745,35 @@ def _verify_required_models() -> None:
         print(f"  Pull the missing one(s) with:  ollama pull <model>")
         raise SystemExit(1)
     print("Ollama models verified.")
+
+
+def _make_classifier(recheck_seconds: float) -> "DomainClassifier":
+    """
+    Central helper for building the DomainClassifier with the correct
+    backend-specific batch size and worker count.
+    """
+    if CLASSIFIER_BACKEND == "deepseek":
+        if not DEEPSEEK_API_KEY:
+            raise SystemExit(
+                "ERROR: CLASSIFIER_BACKEND='deepseek' but DEEPSEEK_API_KEY is empty.\n"
+                '  PowerShell:  $env:DEEPSEEK_API_KEY="sk-..."'
+            )
+        return DomainClassifier(
+            model=DOMAIN_CLASSIFY_MODEL,
+            batch_size=DEEPSEEK_DOMAIN_BATCH_SIZE,
+            classifier_workers=DEEPSEEK_CLASSIFIER_WORKERS,
+            recheck_seconds=recheck_seconds,
+            backend="deepseek",
+            deepseek_api_key=DEEPSEEK_API_KEY,
+            deepseek_model=DEEPSEEK_CLASSIFY_MODEL,
+        )
+    return DomainClassifier(
+        model=DOMAIN_CLASSIFY_MODEL,
+        batch_size=DOMAIN_BATCH_SIZE,
+        classifier_workers=DOMAIN_CLASSIFIER_WORKERS,
+        recheck_seconds=recheck_seconds,
+        backend="ollama",
+    )
 
 
 def analyze_csv_file(
@@ -2683,11 +2812,7 @@ def analyze_csv_file(
     load_dynamic_cache()
 
     _shutdown_existing_classifier()
-    domain_classifier = DomainClassifier(
-        model=DOMAIN_CLASSIFY_MODEL,
-        batch_size=DOMAIN_BATCH_SIZE,
-        recheck_seconds=recheck_unknown_days * 86400,
-    )
+    domain_classifier = _make_classifier(recheck_unknown_days * 86400)
 
     process_file(csv_path, output_path, review_path, workers, progress_every,
                  callback, log_year=log_year)
@@ -2799,11 +2924,7 @@ def main() -> None:
     load_dynamic_cache()
 
     _shutdown_existing_classifier()
-    domain_classifier = DomainClassifier(
-        model=DOMAIN_CLASSIFY_MODEL,
-        batch_size=DOMAIN_BATCH_SIZE,
-        recheck_seconds=args.recheck_unknown_days * 86400,
-    )
+    domain_classifier = _make_classifier(args.recheck_unknown_days * 86400)
 
     workers = max(1, args.workers)
 
@@ -2814,8 +2935,16 @@ def main() -> None:
     print(f"Session gap          : {SESSION_GAP_SECONDS}s")
     print(f"Ollama host          : {DEFAULT_OLLAMA_HOST}")
     print(f"Ollama timeout       : {OLLAMA_REQUEST_TIMEOUT}s")
-    print(f"Classifier model     : {DOMAIN_CLASSIFY_MODEL}")
-    print(f"Analyzer model       : {ANALYSIS_MODEL}")
+    print(f"Analyzer model       : {ANALYSIS_MODEL}  (Ollama)")
+    print(f"Classifier backend   : {CLASSIFIER_BACKEND}")
+    if CLASSIFIER_BACKEND == "deepseek":
+        print(f"Classifier model     : {DEEPSEEK_CLASSIFY_MODEL}  (DeepSeek API)")
+        print(f"Classifier batch     : {DEEPSEEK_DOMAIN_BATCH_SIZE}  "
+              f"workers={DEEPSEEK_CLASSIFIER_WORKERS}")
+    else:
+        print(f"Classifier model     : {DOMAIN_CLASSIFY_MODEL}  (Ollama)")
+        print(f"Classifier batch     : {DOMAIN_BATCH_SIZE}  "
+              f"workers={DOMAIN_CLASSIFIER_WORKERS}")
     print(f"AI confirm threshold : {CONFIDENCE_THRESHOLD:.2f}")
     print(f"Weak-AI floor        : {WEAK_AI_THRESHOLD:.2f}  "
           f"(0.50 <= conf < {CONFIDENCE_THRESHOLD:.2f} → needs_review)")

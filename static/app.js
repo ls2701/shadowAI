@@ -4,25 +4,100 @@
 
 const $  = (id) => document.getElementById(id);
 const $$ = (sel) => document.querySelectorAll(sel);
-const API_BASE = "http://127.0.0.1:8000";
+
+/* ------------------------------------------------------------
+   API base — auto-detect.
+
+   * If the page is already served by the API on :8000, use
+     relative URLs ("" → same origin). No CORS, no wrong host.
+   * Otherwise assume the API is on the same hostname at :8000.
+   ------------------------------------------------------------ */
+const API_BASE = (() => {
+  const { protocol, hostname, port } = window.location;
+  if (port === "8000") return "";
+  // file:// or a different port — target the API on the same host
+  const p = protocol === "https:" ? "https:" : "http:";
+  return `${p}//${hostname}:8000`;
+})();
 const apiUrl = (path) => API_BASE + path;
+
 /* ---------- helpers ---------- */
 const fmt = (n) => (n == null ? "—" : Number(n).toLocaleString());
+
 const fmtBytes = (n) => {
   if (!n) return "0 B";
   if (n > 1e6) return (n / 1e6).toFixed(2) + " MB";
   if (n > 1e3) return (n / 1e3).toFixed(1) + " KB";
   return n + " B";
 };
+
 const sevClass = (s) =>
   ({ Critical: "Critical", High: "High", Medium: "Medium", Low: "Low" }[s] || "Unknown");
 
-/* ---------- tabs ---------- */
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+/* ------------------------------------------------------------
+   Batched feed flushing.
+
+   Every pushFeed() call just appends the HTML string to a
+   per-element array. One requestAnimationFrame later we do a
+   single DOM insertion for the entire batch. This collapses
+   hundreds of SSE events per second into ~60 DOM writes/sec.
+   ------------------------------------------------------------ */
+const FEED_MAX = 60;
+const _pendingFeed = new Map();      // elId -> [html, html, ...]
+let _feedScheduled = false;
+
+function pushFeed(elId, html) {
+  const arr = _pendingFeed.get(elId);
+  if (arr) arr.push(html);
+  else _pendingFeed.set(elId, [html]);
+  if (!_feedScheduled) {
+    _feedScheduled = true;
+    requestAnimationFrame(flushFeeds);
+  }
+}
+
+function flushFeeds() {
+  _feedScheduled = false;
+
+  for (const [elId, batch] of _pendingFeed) {
+    const el = document.getElementById(elId);
+    if (!el) continue;
+
+    const ph = el.querySelector(".placeholder");
+    if (ph) ph.remove();
+
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < batch.length; i++) {
+      const div = document.createElement("div");
+      div.className = "row";
+      div.innerHTML = batch[i];
+      frag.appendChild(div);
+    }
+    el.insertBefore(frag, el.firstChild);
+
+    while (el.children.length > FEED_MAX) {
+      el.removeChild(el.lastChild);
+    }
+  }
+  _pendingFeed.clear();
+}
+
+/* ------------------------------------------------------------
+   Tabs
+   ------------------------------------------------------------ */
+let _loadedTabs = new Set();
+
 $$(".tab").forEach((btn) => {
   btn.addEventListener("click", () => {
     $$(".tab").forEach((b) => b.classList.toggle("active", b === btn));
     const t = btn.dataset.tab;
     $$(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + t));
+
     if (t === "findings") loadFindings();
     if (t === "review")   loadReview();
     if (t === "domains")  loadDomains();
@@ -45,26 +120,17 @@ function updateKpis() {
   $("kpi-ai").textContent       = fmt(state.ai);
   $("kpi-findings").textContent = fmt(state.findings);
 }
+
 setInterval(() => {
   if (!state.startedAt) return;
   const s = (Date.now() - state.startedAt) / 1000;
-  $("kpi-elapsed").textContent = s < 60 ? s.toFixed(0) + "s" : (s / 60).toFixed(1) + "m";
+  $("kpi-elapsed").textContent =
+    s < 60 ? s.toFixed(0) + "s" : (s / 60).toFixed(1) + "m";
 }, 500);
 
 function setPhase(name) {
   $$(".phase").forEach((el) =>
     el.classList.toggle("active", el.dataset.phase === name));
-}
-
-function pushFeed(elId, html) {
-  const el = $(elId);
-  const ph = el.querySelector(".placeholder");
-  if (ph) ph.remove();
-  const div = document.createElement("div");
-  div.className = "row";
-  div.innerHTML = html;
-  el.prepend(div);
-  while (el.children.length > 250) el.removeChild(el.lastChild);
 }
 
 function resetRun() {
@@ -83,7 +149,7 @@ function resetRun() {
 }
 
 /* ============================================================
-   SSE handler
+   SSE
    ============================================================ */
 function connect() {
   const es = new EventSource(apiUrl("/stream"));
@@ -114,18 +180,21 @@ function handleEvent(e) {
       $("run-id").textContent = e.csv ? "· " + e.csv : "";
       setPhase("1");
       pushFeed("chunk-feed",
-        `<span class="badge AI">▶ run</span> <span class="muted">${e.csv || ""}</span>`);
+        `<span class="badge AI">▶ run</span> <span class="muted">${esc(e.csv) || ""}</span>`);
       break;
 
     case "phase1_progress":
-      state.rows = e.rows; updateKpis();
+      state.rows = e.rows;
+      updateKpis();
       break;
 
     case "phase1_done":
-      state.rows = e.rows; updateKpis();
+      state.rows = e.rows;
+      updateKpis();
       setPhase("2");
       pushFeed("chunk-feed",
-        `<span class="muted">✓ phase 1 — ${fmt(e.rows)} rows, ${fmt(e.failed)} failed, ${fmt(e.ooo)} out-of-order</span>`);
+        `<span class="muted">✓ phase 1 — ${fmt(e.rows)} rows, ` +
+        `${fmt(e.failed)} failed, ${fmt(e.ooo)} out-of-order</span>`);
       break;
 
     case "phase2_done":
@@ -146,9 +215,10 @@ function handleEvent(e) {
       pushFeed("chunk-feed",
         `<span class="badge ${kind}">[${kind}]</span> ` +
         `<span class="muted">#${e.chunk_id}</span> ` +
-        `<span>${e.tier}</span> ` +
-        `<span class="muted">${apps}</span> ` +
-        `<span class="muted">${e.events} ev · ${fmtBytes(e.bytes)}${e.user ? " · " + e.user : ""}</span>`);
+        `<span>${esc(e.tier)}</span> ` +
+        `<span class="muted">${esc(apps)}</span> ` +
+        `<span class="muted">${e.events} ev · ${fmtBytes(e.bytes)}` +
+        `${e.user ? " · " + esc(e.user) : ""}</span>`);
       break;
     }
 
@@ -158,8 +228,8 @@ function handleEvent(e) {
       const status = (e.status || "unknown").toLowerCase();
       pushFeed("classify-feed",
         `<span class="badge ${status}">${status.toUpperCase()}</span> ` +
-        `<span>${e.domain}</span> ` +
-        (e.app ? `<span class="muted">→ ${e.app}</span> ` : "") +
+        `<span>${esc(e.domain)}</span> ` +
+        (e.app ? `<span class="muted">→ ${esc(e.app)}</span> ` : "") +
         `<span class="muted">conf=${(e.confidence || 0).toFixed(2)}</span>`);
       break;
     }
@@ -176,13 +246,13 @@ function handleEvent(e) {
       const tr = document.createElement("tr");
       tr.innerHTML = `
         <td class="mono">#${e.chunk_id ?? "—"}</td>
-        <td>${e.user || "—"}</td>
-        <td>${e.application || "—"}</td>
-        <td class="muted">${e.match_tier || "—"}</td>
-        <td><span class="pill ${sevClass(e.severity)}">${e.severity || "—"}</span></td>
+        <td>${esc(e.user) || "—"}</td>
+        <td>${esc(e.application) || "—"}</td>
+        <td class="muted">${esc(e.match_tier) || "—"}</td>
+        <td><span class="pill ${sevClass(e.severity)}">${esc(e.severity) || "—"}</span></td>
         <td class="conf muted">${e.confidence != null ? Number(e.confidence).toFixed(2) : "—"}</td>
         <td class="conf muted">${fmtBytes(e.bytes)}</td>
-        <td class="muted">${e.reason || ""}</td>`;
+        <td class="muted">${esc(e.reason) || ""}</td>`;
       tr.style.cursor = "pointer";
       tr.addEventListener("click", () => openEvidence(e.chunk_id));
       $("findings-body").prepend(tr);
@@ -195,14 +265,16 @@ function handleEvent(e) {
       pushFeed("chunk-feed",
         `<span class="badge non_ai">■ finished</span> ` +
         `<span class="muted">${fmt(e.rows)} rows · ${fmt(e.chunks)} chunks · ` +
-        `${fmt(e.ai)} AI · ${fmt(e.findings)} findings · ${(e.elapsed || 0).toFixed(1)}s</span>`);
+        `${fmt(e.ai)} AI · ${fmt(e.findings)} findings · ` +
+        `${(e.elapsed || 0).toFixed(1)}s</span>`);
+      loadFindings();
       loadReview();
       loadDomains();
       break;
 
     case "stdout":
-      // Uncomment to see raw analyser output in the chunk feed.
-      // pushFeed("chunk-feed", `<span class="muted mono">${e.line}</span>`);
+      // Raw analyser output; uncomment to display in the feed.
+      // pushFeed("chunk-feed", `<span class="muted mono">${esc(e.line)}</span>`);
       break;
   }
 }
@@ -211,79 +283,109 @@ connect();
 setPhase("1");
 
 /* ============================================================
-   TAB: Findings (historical / paginated)
+   TAB: Findings
    ============================================================ */
 async function loadFindings() {
-  const sev = $("f-severity").value;
-  const app = $("f-app").value.trim();
+  const sev  = $("f-severity").value;
+  const app  = $("f-app").value.trim();
   const user = $("f-user").value.trim();
   const conf = $("f-conf").value;
 
   const qs = new URLSearchParams({ limit: "200" });
-  if (sev) qs.set("severity", sev);
-  if (app) qs.set("application", app);
+  if (sev)  qs.set("severity", sev);
+  if (app)  qs.set("application", app);
   if (user) qs.set("user", user);
   if (conf && Number(conf) > 0) qs.set("min_confidence", conf);
 
   const body = $("all-findings-body");
   body.innerHTML = '<tr><td colspan="8" class="placeholder">loading…</td></tr>';
+
+  const url = apiUrl("/findings?" + qs);
   try {
-    const r = await fetch(apiUrl("/findings?" + qs));
-    if (!r.ok) throw new Error("HTTP " + r.status);
+    const r = await fetch(url);
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`HTTP ${r.status} — ${t.slice(0, 200) || "(empty)"}`);
+    }
     const data = await r.json();
+    const items =
+      Array.isArray(data)         ? data :
+      Array.isArray(data.items)   ? data.items :
+      Array.isArray(data.findings)? data.findings :
+      [];
+
     body.innerHTML = "";
-    if (!data.items.length) {
+    if (!items.length) {
       body.innerHTML = '<tr><td colspan="8" class="placeholder">no matches</td></tr>';
       return;
     }
-    data.items.forEach((row) => {
+    for (const row of items) {
       const tr = document.createElement("tr");
       tr.innerHTML = `
-        <td class="mono">#${row._chunk_id}</td>
-        <td>${row._user || "—"}</td>
-        <td>${row.application || "—"}</td>
-        <td class="muted">${row._match_tier || "—"}</td>
-        <td><span class="pill ${sevClass(row.severity)}">${row.severity || "—"}</span></td>
+        <td class="mono">#${row._chunk_id ?? "—"}</td>
+        <td>${esc(row._user) || "—"}</td>
+        <td>${esc(row.application) || "—"}</td>
+        <td class="muted">${esc(row._match_tier) || "—"}</td>
+        <td><span class="pill ${sevClass(row.severity)}">${esc(row.severity) || "—"}</span></td>
         <td class="conf muted">${row.confidence != null ? Number(row.confidence).toFixed(2) : "—"}</td>
         <td class="conf muted">${fmtBytes(row._bytes)}</td>
-        <td><a class="link" data-chunk="${row._chunk_id}">view evidence</a></td>`;
-      tr.querySelector("a").addEventListener("click", () => openEvidence(row._chunk_id));
+        <td><a class="link" href="#">view evidence</a></td>`;
+      tr.querySelector("a").addEventListener("click", (ev) => {
+        ev.preventDefault();
+        openEvidence(row._chunk_id);
+      });
       body.appendChild(tr);
-    });
+    }
   } catch (err) {
-    body.innerHTML = `<tr><td colspan="8" class="placeholder">error: ${err}</td></tr>`;
+    console.error("[findings] failed:", err);
+    body.innerHTML =
+      `<tr><td colspan="8" class="placeholder">error: ${esc(err.message)}</td></tr>`;
   }
 }
 $("f-apply").addEventListener("click", loadFindings);
 
 /* ============================================================
-   TAB: Review queue
+   TAB: Review
    ============================================================ */
 async function loadReview() {
   const body = $("review-body");
   body.innerHTML = '<tr><td colspan="5" class="placeholder">loading…</td></tr>';
+
   try {
     const r = await fetch(apiUrl("/review?limit=500"));
-    if (!r.ok) throw new Error("HTTP " + r.status);
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`HTTP ${r.status} — ${t.slice(0, 200) || "(empty)"}`);
+    }
     const data = await r.json();
-    $("review-count").textContent = data.total + " chunks";
+    const items =
+      Array.isArray(data)       ? data :
+      Array.isArray(data.items) ? data.items :
+      [];
+
+    $("review-count").textContent = (data.total ?? items.length) + " chunks";
     body.innerHTML = "";
-    if (!data.items.length) {
+    if (!items.length) {
       body.innerHTML = '<tr><td colspan="5" class="placeholder">nothing to review</td></tr>';
       return;
     }
-    data.items.forEach((row) => {
+    for (const row of items) {
       const tr = document.createElement("tr");
+      const domainsHtml = (row.unknown_domains || [])
+        .map((d) => esc(d))
+        .join("<br>");
       tr.innerHTML = `
-        <td class="mono">#${row.chunk_id}</td>
-        <td class="muted">${row.sensor || "—"}</td>
-        <td>${row.user || "—"}</td>
-        <td class="mono muted">${(row.unknown_domains || []).join("<br>")}</td>
+        <td class="mono">#${row.chunk_id ?? "—"}</td>
+        <td class="muted">${esc(row.sensor) || "—"}</td>
+        <td>${esc(row.user) || "—"}</td>
+        <td class="mono muted">${domainsHtml}</td>
         <td class="conf muted">${row.event_count || 0}</td>`;
       body.appendChild(tr);
-    });
+    }
   } catch (err) {
-    body.innerHTML = `<tr><td colspan="5" class="placeholder">error: ${err}</td></tr>`;
+    console.error("[review] failed:", err);
+    body.innerHTML =
+      `<tr><td colspan="5" class="placeholder">error: ${esc(err.message)}</td></tr>`;
   }
 }
 
@@ -297,28 +399,57 @@ async function loadDomains() {
 
   const body = $("domains-body");
   body.innerHTML = '<tr><td colspan="5" class="placeholder">loading…</td></tr>';
+
+  const url = apiUrl("/domains?" + qs);
+  console.log("[domains] GET", url);
+
   try {
-    const r = await fetch(apiUrl("/domains?" + qs));
-    if (!r.ok) throw new Error("HTTP " + r.status);
+    const r = await fetch(url);
+    console.log("[domains] status", r.status, r.headers.get("content-type"));
+
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`HTTP ${r.status} — ${t.slice(0, 200) || "(empty body)"}`);
+    }
+
     const data = await r.json();
+
+    // Accept {items:[...]}, {domains:[...]}, plain array, or dict-of-domains.
+    let items;
+    if (Array.isArray(data))               items = data;
+    else if (Array.isArray(data.items))    items = data.items;
+    else if (Array.isArray(data.domains))  items = data.domains;
+    else if (data && typeof data === "object") {
+      items = Object.entries(data).map(([domain, v]) =>
+        typeof v === "object" && v !== null ? { domain, ...v } : { domain, status: v });
+    } else {
+      items = [];
+    }
+
     body.innerHTML = "";
-    if (!data.items.length) {
+    if (!items.length) {
       body.innerHTML = '<tr><td colspan="5" class="placeholder">no domains cached</td></tr>';
       return;
     }
-    data.items.forEach((row) => {
+
+    for (const row of items) {
+      const st = (row.status || "unknown").toLowerCase();
+      const t  = row.last_attempt
+        ? new Date(row.last_attempt * 1000).toLocaleString()
+        : "—";
       const tr = document.createElement("tr");
-      const t = row.last_attempt ? new Date(row.last_attempt * 1000).toLocaleString() : "—";
       tr.innerHTML = `
-        <td class="mono">${row.domain}</td>
-        <td><span class="badge ${row.status}">${(row.status || "unknown").toUpperCase()}</span></td>
-        <td>${row.app || "—"}</td>
-        <td class="conf muted">${(row.confidence || 0).toFixed(2)}</td>
+        <td class="mono">${esc(row.domain) || "—"}</td>
+        <td><span class="badge ${st}">${st.toUpperCase()}</span></td>
+        <td>${esc(row.app) || "—"}</td>
+        <td class="conf muted">${(Number(row.confidence) || 0).toFixed(2)}</td>
         <td class="muted">${t}</td>`;
       body.appendChild(tr);
-    });
+    }
   } catch (err) {
-    body.innerHTML = `<tr><td colspan="5" class="placeholder">error: ${err}</td></tr>`;
+    console.error("[domains] failed:", err);
+    body.innerHTML =
+      `<tr><td colspan="5" class="placeholder">error: ${esc(err.message)}</td></tr>`;
   }
 }
 $("d-apply").addEventListener("click", loadDomains);
@@ -328,7 +459,8 @@ $("d-apply").addEventListener("click", loadDomains);
    ============================================================ */
 async function openEvidence(chunkId) {
   if (chunkId == null) return;
-  const drawer = $("drawer"), backdrop = $("backdrop");
+  const drawer   = $("drawer");
+  const backdrop = $("backdrop");
   drawer.classList.add("open");
   backdrop.classList.add("on");
   drawer.setAttribute("aria-hidden", "false");
@@ -338,11 +470,16 @@ async function openEvidence(chunkId) {
 
   try {
     const r = await fetch(apiUrl(`/findings/${chunkId}/evidence`));
-    if (!r.ok) throw new Error("HTTP " + r.status);
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`HTTP ${r.status} — ${t.slice(0, 200) || "(empty)"}`);
+    }
     const ev = await r.json();
     $("drawer-body").innerHTML = renderEvidence(ev);
   } catch (err) {
-    $("drawer-body").innerHTML = `<div class="muted">Failed to load evidence: ${err}</div>`;
+    console.error("[evidence] failed:", err);
+    $("drawer-body").innerHTML =
+      `<div class="muted">Failed to load evidence: ${esc(err.message)}</div>`;
   }
 }
 
@@ -355,13 +492,8 @@ $("drawer-close").addEventListener("click", closeDrawer);
 $("backdrop").addEventListener("click", closeDrawer);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
 
-function esc(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-
 function renderEvidence(ev) {
-  const apps = ev.matched_applications || {};
+  const apps    = ev.matched_applications || {};
   const domains = ev.domains || [];
   const samples = ev.sample_events || [];
 
@@ -485,37 +617,34 @@ upForm.addEventListener("submit", async (ev) => {
   upResult.hidden = true;
 
   try {
-    const r = await fetch(apiUrl("/upload"), {
-      method: "POST",
-      body: fd
-    });
-
-    // Read body as text first so an empty or non-JSON response gives a real error.
+    const r = await fetch(apiUrl("/upload"), { method: "POST", body: fd });
     const raw = await r.text();
 
     if (!r.ok) {
       let detail = raw;
       try { detail = JSON.parse(raw).detail || raw; } catch { /* keep raw */ }
-      throw new Error(detail || `HTTP ${r.status} ${r.statusText} (empty body — check uvicorn console)`);
+      throw new Error(detail || `HTTP ${r.status} ${r.statusText} (empty body)`);
     }
-    if (!raw) {
-      throw new Error("server returned an empty 200 response");
-    }
+    if (!raw) throw new Error("server returned an empty 200 response");
 
     const data = JSON.parse(raw);
 
     upStatus.textContent = "running";
     showUploadResult("ok",
-      `Started analysis on <strong>${esc(data.csv)}</strong> — pid ${data.pid}.<br>` +
-      `<span class="muted">Switch to the <a class="link" id="goto-live">Live</a> tab to watch progress.</span>`);
-    $("goto-live").addEventListener("click", () => {
-      document.querySelector('.tab[data-tab="live"]').click();
-    });
+      `Started analysis on <strong>${esc(data.csv)}</strong> — pid ${esc(data.pid)}.<br>` +
+      `<span class="muted">Switch to the <a class="link" href="#" id="goto-live">Live</a> tab to watch progress.</span>`);
+
+    const liveLink = $("goto-live");
+    if (liveLink) {
+      liveLink.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        document.querySelector('.tab[data-tab="live"]').click();
+      });
+    }
 
     pollRunUntilDone();
-
   } catch (err) {
-    showUploadResult("err", `Upload failed: ${err.message}`);
+    showUploadResult("err", `Upload failed: ${esc(err.message)}`);
     upSubmit.disabled = false;
     upCancel.hidden = true;
     upStatus.textContent = "idle";
@@ -533,28 +662,38 @@ upCancel.addEventListener("click", () => {
 async function pollRunUntilDone() {
   try {
     const r = await fetch(apiUrl("/run-status"));
+    if (!r.ok) throw new Error("HTTP " + r.status);
     const s = await r.json();
+
     if (s.running) {
       setTimeout(pollRunUntilDone, 3000);
       return;
     }
+
     upStatus.textContent = s.exit_code === 0 ? "finished" : `exited (${s.exit_code})`;
     upSubmit.disabled = false;
     upCancel.hidden = true;
     uploadInFlight = false;
+
     showUploadResult(
       s.exit_code === 0 ? "ok" : "err",
       `Run on <strong>${esc(s.csv)}</strong> finished with exit code ${s.exit_code}. ` +
-      `Findings are in the <a class="link" id="goto-findings">Findings</a> tab.`
+      `Findings are in the <a class="link" href="#" id="goto-findings">Findings</a> tab.`
     );
+
     const link = $("goto-findings");
-    if (link) link.addEventListener("click", () => {
-      document.querySelector('.tab[data-tab="findings"]').click();
-    });
+    if (link) {
+      link.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        document.querySelector('.tab[data-tab="findings"]').click();
+      });
+    }
+
     loadFindings();
     loadReview();
     loadDomains();
-  } catch {
+  } catch (err) {
+    console.warn("[run-status] retrying:", err);
     setTimeout(pollRunUntilDone, 5000);
   }
 }
@@ -566,7 +705,9 @@ function showUploadResult(kind, html) {
 }
 
 /* ============================================================
-   Initial tab loads
+   Initial state
+   ------------------------------------------------------------
+   We intentionally do NOT eagerly load the Review/Domains/
+   Findings tabs on page load. The SSE stream drives Live, and
+   the other tabs fetch on first click.
    ============================================================ */
-loadReview();
-loadDomains();
