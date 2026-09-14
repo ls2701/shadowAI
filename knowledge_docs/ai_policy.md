@@ -1,0 +1,1 @@
+﻿AI Acceptable Use Policy. ChatGPT (chatgpt.com), Claude (claude.ai), Gemini and Perplexity are NOT approved for company or customer data. Microsoft Copilot on the enterprise tenant is approved. Uploading source code, credentials, or PII to any unapproved AI tool is a critical violation. Any transfer over 100 KB to an unapproved AI endpoint must be escalated to the security team.

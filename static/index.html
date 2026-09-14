@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Shadow AI — Live Dashboard</title>
+<link rel="stylesheet" href="./style.css"><link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="dot" id="live-dot"></span>
+    <h1>Shadow AI <span class="sub">Live Pipeline</span></h1>
+    <span class="run-id" id="run-id"></span>
+  </div>
+  <div class="conn" id="conn-status">connecting…</div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-tab="live">Live</button>
+  <button class="tab" data-tab="upload">Upload &amp; Run</button>
+  <button class="tab" data-tab="findings">Findings</button>
+  <button class="tab" data-tab="review">Needs review</button>
+  <button class="tab" data-tab="domains">Domain cache</button>
+</nav>
+
+<main>
+
+  <!-- ============ LIVE ============ -->
+  <section class="view active" id="view-live">
+    <div class="kpis">
+      <div class="kpi"><div class="label">Rows read</div><div class="value" id="kpi-rows">0</div></div>
+      <div class="kpi"><div class="label">Chunks</div><div class="value" id="kpi-chunks">0</div></div>
+      <div class="kpi"><div class="label">Needs review</div><div class="value warn" id="kpi-review">0</div></div>
+      <div class="kpi"><div class="label">AI chunks</div><div class="value ai" id="kpi-ai">0</div></div>
+      <div class="kpi"><div class="label">Findings</div><div class="value good" id="kpi-findings">0</div></div>
+      <div class="kpi"><div class="label">Elapsed</div><div class="value" id="kpi-elapsed">0s</div></div>
+    </div>
+
+    <div class="phases" id="phases">
+      <div class="phase" data-phase="1">① Read + normalize</div>
+      <div class="phase" data-phase="2">② Sort per entity</div>
+      <div class="phase" data-phase="3">③ Chunk + analyze</div>
+      <div class="phase" data-phase="classify">Classifier</div>
+      <div class="phase" data-phase="done">✔ Done</div>
+    </div>
+
+    <div class="grid-2">
+      <div class="panel">
+        <div class="panel-head">
+          <span>Classifier verdicts</span>
+          <span class="muted" id="classify-count">0</span>
+        </div>
+        <div class="feed" id="classify-feed"><div class="placeholder">waiting…</div></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <span>Chunk activity</span>
+          <span class="muted" id="chunk-count">0</span>
+        </div>
+        <div class="feed" id="chunk-feed"><div class="placeholder">waiting…</div></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span>Findings (this run)</span>
+        <span class="muted" id="finding-count">0</span>
+      </div>
+      <table class="table" id="findings-table">
+        <thead>
+          <tr>
+            <th>Chunk</th><th>User</th><th>App</th><th>Tier</th>
+            <th>Severity</th><th>Conf</th><th>Bytes</th><th>Reason</th>
+          </tr>
+        </thead>
+        <tbody id="findings-body">
+          <tr><td colspan="8" class="placeholder">no findings yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ UPLOAD ============ -->
+  <section class="view" id="view-upload">
+    <div class="panel">
+      <div class="panel-head">
+        <span>Analyse a new CSV</span>
+        <span class="muted" id="upload-status">idle</span>
+      </div>
+
+      <div style="padding:18px">
+        <form id="upload-form"
+      class="upload-grid"
+      action="/upload"
+      method="post"
+      enctype="multipart/form-data">
+
+          <label class="file-drop" id="file-drop">
+            <input type="file"
+       id="file-input"
+       name="file"
+       accept=".csv"
+       required>
+            <div class="file-drop-inner">
+              <div class="file-icon">⬆</div>
+              <div class="file-label" id="file-label">Click to choose a CSV, or drag &amp; drop</div>
+              <div class="muted small">Format: <code>timestamp,sensor,source,event</code></div>
+            </div>
+          </label>
+
+          <label>Classifier model
+            <input id="up-classify" value="qwen2.5:14b" placeholder="qwen2.5:14b">
+          </label>
+
+          <label>Log year (optional)
+            <input id="up-log-year" type="number" placeholder="e.g. 2026">
+          </label>
+
+          <label class="checkline">
+            <input type="checkbox" id="up-reset-cache">
+            Reset dynamic domain cache before running
+          </label>
+
+          <div class="actions">
+            <button type="submit" id="up-submit">Start analysis</button>
+            <button type="button" id="up-cancel" class="ghost" hidden>Cancel</button>
+          </div>
+
+        </form>
+
+        <div id="upload-result" class="upload-result" hidden></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ FINDINGS ============ -->
+  <section class="view" id="view-findings">
+    <div class="filters">
+      <label>Severity
+        <select id="f-severity">
+          <option value="">all</option>
+          <option>Critical</option><option>High</option>
+          <option>Medium</option><option>Low</option>
+        </select>
+      </label>
+      <label>Application <input id="f-app" placeholder="any"></label>
+      <label>User <input id="f-user" placeholder="any"></label>
+      <label>Min confidence
+        <input id="f-conf" type="number" min="0" max="1" step="0.05" value="0">
+      </label>
+      <button id="f-apply">Apply</button>
+    </div>
+
+    <div class="panel">
+      <table class="table" id="all-findings-table">
+        <thead>
+          <tr>
+            <th>Chunk</th><th>User</th><th>App</th><th>Tier</th>
+            <th>Severity</th><th>Conf</th><th>Bytes</th><th></th>
+          </tr>
+        </thead>
+        <tbody id="all-findings-body">
+          <tr><td colspan="8" class="placeholder">loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ REVIEW ============ -->
+  <section class="view" id="view-review">
+    <div class="panel">
+      <div class="panel-head">
+        <span>Chunks with unresolved domains</span>
+        <span class="muted" id="review-count">0</span>
+      </div>
+      <table class="table" id="review-table">
+        <thead>
+          <tr><th>Chunk</th><th>Sensor</th><th>User</th><th>Unknown domains</th><th>Events</th></tr>
+        </thead>
+        <tbody id="review-body">
+          <tr><td colspan="5" class="placeholder">loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ DOMAIN CACHE ============ -->
+  <section class="view" id="view-domains">
+    <div class="filters">
+      <label>Status
+        <select id="d-status">
+          <option value="">all</option>
+          <option value="ai">ai</option>
+          <option value="non_ai">non_ai</option>
+          <option value="unknown">unknown</option>
+        </select>
+      </label>
+      <button id="d-apply">Refresh</button>
+    </div>
+    <div class="panel">
+      <table class="table" id="domains-table">
+        <thead>
+          <tr><th>Domain</th><th>Status</th><th>App</th><th>Confidence</th><th>Last attempt</th></tr>
+        </thead>
+        <tbody id="domains-body">
+          <tr><td colspan="5" class="placeholder">loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<!-- ============ EVIDENCE DRAWER ============ -->
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-head">
+    <h2 id="drawer-title">Evidence</h2>
+    <button id="drawer-close" aria-label="close">✕</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+<div class="backdrop" id="backdrop"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

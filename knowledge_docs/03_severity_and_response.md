@@ -1,0 +1,13 @@
+# Severity Rubric and Response Actions
+
+## Severity Rubric
+CRITICAL applies when Confidential data such as source code, credentials, PII, or financial records is sent to an unapproved AI tool, or any transfer over 1 MB goes to an unapproved AI or chatbot endpoint, or cumulative transfers exceed 500 KB to the same unapproved service within 24 hours. HIGH applies to any confirmed upload, POST, or file-share action to an unapproved generative AI, chatbot, or AI coding assistant even without confirmed Confidential data, or use of an unapproved browser-extension or IDE AI assistant on a device with access to Confidential data. MEDIUM applies to browsing or DNS activity to an unapproved AI tool with little or no outbound data, use of a customer-facing chatbot or live-chat platform outside expected support-ticket patterns, or a text-pattern-only match that plausibly indicates AI usage but lacks a confirmed domain match. LOW applies to use of an Approved AI Tool through its certified deployment, or an AI-adjacent domain with no meaningful data transfer and low-confidence evidence.
+
+## Recommended Response Actions
+For CRITICAL findings, immediately notify the Security team and the user's manager, capture the full session for the affected host, block the destination domain at the proxy or firewall, and open a formal incident ticket. For HIGH findings, notify the Security team the same day, warn the user with a documented reminder of this policy, log the finding for weekly trend review, and consider blocking the destination if repeated. For MEDIUM findings, log for trend analysis and include in the weekly Shadow AI summary report; individual notification is only required if the same user and tool pair recurs three or more times in a rolling 30-day window, at which point treat it as HIGH. For LOW findings, monitor only; no action is required.
+
+## Escalation Path
+The Security team distribution list is the first point of contact for CRITICAL and HIGH findings. The user's direct manager should be looped in for CRITICAL findings and for any repeated HIGH finding from the same individual. Legal and Compliance should be notified whenever a finding involves confirmed customer PII or a regulated data type such as financial or health information.
+
+## Handling Uncertain or Unrecognized Findings
+Findings where the destination domain does not match a known AI vendor are not automatically dismissed as non-AI. They should be reviewed weekly: if a domain is confirmed to be an AI tool, add it to the Approved or Unapproved list in the AI Acceptable Use Policy and re-run analysis on affected time windows. If confirmed non-AI, no further action is needed.

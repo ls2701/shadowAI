@@ -1,0 +1,16 @@
+@"
+__pycache__/
+*.pyc
+
+jobs/
+uploads/
+downloaded_chunks/
+
+*.csv
+*.json
+*.jsonl
+*.pdf
+*.docx
+
+dynamic_domain_cache.json
+"@ | Out-File -Encoding utf8 .gitignore
